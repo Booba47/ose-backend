@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { cleanString, isNonEmptyString } from '../utils/validation.js';
@@ -46,9 +47,7 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// PRÉPARER UN TÉLÉVERSEMENT SÉCURISÉ
-// Le serveur renvoie une URL signée temporaire.
-// Le fichier sera ensuite envoyé directement à Supabase Storage.
+// PRÉPARER UN TÉLÉVERSEMENT
 router.post('/upload-url', requireAuth, async (req, res) => {
   try {
     const fileName = cleanString(req.body?.fileName);
@@ -62,7 +61,7 @@ router.post('/upload-url', requireAuth, async (req, res) => {
       });
     }
 
-    if (!ALLOWED_TYPES[contentType]) {
+    if (!Object.hasOwn(ALLOWED_TYPES, contentType)) {
       return res.status(400).json({
         success: false,
         message: 'Format accepté : JPG, PNG ou WebP.',
@@ -101,7 +100,7 @@ router.post('/upload-url', requireAuth, async (req, res) => {
     }
 
     const extension = ALLOWED_TYPES[contentType];
-    const storagePath = `${req.user.id}/${crypto.randomUUID()}.${extension}`;
+    const storagePath = `${req.user.id}/${randomUUID()}.${extension}`;
 
     const { data, error } = await supabaseAdmin.storage
       .from(BUCKET)
@@ -132,15 +131,18 @@ router.post('/upload-url', requireAuth, async (req, res) => {
   }
 });
 
-// ENREGISTRER UNE PHOTO APRÈS SON TÉLÉVERSEMENT
+// CONFIRMER LE TÉLÉVERSEMENT
 router.post('/confirm', requireAuth, async (req, res) => {
   try {
     const storagePath = cleanString(req.body?.storagePath);
 
-    if (!isNonEmptyString(storagePath)) {
+    if (
+      !isNonEmptyString(storagePath) ||
+      storagePath.length > 250
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'Chemin de photo manquant.',
+        message: 'Chemin de photo invalide.',
       });
     }
 
@@ -153,7 +155,7 @@ router.post('/confirm', requireAuth, async (req, res) => {
 
     const { data: existing, error: existingError } = await supabaseAdmin
       .from('photos')
-      .select('id')
+      .select('id, storage_path, photo_url, position, created_at')
       .eq('user_id', req.user.id)
       .eq('storage_path', storagePath)
       .maybeSingle();
@@ -194,19 +196,50 @@ router.post('/confirm', requireAuth, async (req, res) => {
       });
     }
 
-    const { data: storedFile, error: storageError } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .list(req.user.id, { limit: 100 });
-
     const fileName = storagePath.split('/').pop();
 
-    if (
-      storageError ||
-      !(storedFile ?? []).some((file) => file.name === fileName)
-    ) {
+    const { data: storedFiles, error: storageError } =
+      await supabaseAdmin.storage
+        .from(BUCKET)
+        .list(req.user.id, { limit: 100 });
+
+    if (storageError) {
+      console.error('Erreur vérification stockage :', storageError);
+      return res.status(500).json({
+        success: false,
+        message: 'Impossible de vérifier le stockage.',
+      });
+    }
+
+    const storedFile = (storedFiles ?? []).find(
+      (file) => file.name === fileName,
+    );
+
+    if (!storedFile) {
       return res.status(400).json({
         success: false,
         message: 'Photo introuvable dans le stockage.',
+      });
+    }
+
+    const metadata = storedFile.metadata;
+    const actualSize = Number(metadata?.size);
+    const actualType = metadata?.mimetype;
+
+    if (
+      !metadata ||
+      !Number.isFinite(actualSize) ||
+      actualSize <= 0 ||
+      actualSize > MAX_FILE_SIZE ||
+      !Object.hasOwn(ALLOWED_TYPES, actualType)
+    ) {
+      await supabaseAdmin.storage
+        .from(BUCKET)
+        .remove([storagePath]);
+
+      return res.status(400).json({
+        success: false,
+        message: 'Fichier invalide ou trop volumineux.',
       });
     }
 
@@ -257,7 +290,7 @@ router.patch('/:photoId/primary', requireAuth, async (req, res) => {
 
     const { data: photo, error: photoError } = await supabaseAdmin
       .from('photos')
-      .select('id, user_id, position')
+      .select('id, user_id')
       .eq('id', photoId)
       .eq('user_id', req.user.id)
       .maybeSingle();
@@ -271,7 +304,7 @@ router.patch('/:photoId/primary', requireAuth, async (req, res) => {
 
     const { data: photos, error: listError } = await supabaseAdmin
       .from('photos')
-      .select('id, position')
+      .select('id')
       .eq('user_id', req.user.id)
       .order('position', { ascending: true });
 
@@ -320,6 +353,13 @@ router.patch('/:photoId/primary', requireAuth, async (req, res) => {
 router.delete('/:photoId', requireAuth, async (req, res) => {
   try {
     const photoId = cleanString(req.params.photoId);
+
+    if (!isNonEmptyString(photoId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Identifiant de photo invalide.',
+      });
+    }
 
     const { data: photo, error: findError } = await supabaseAdmin
       .from('photos')
@@ -374,4 +414,4 @@ router.delete('/:photoId', requireAuth, async (req, res) => {
   }
 });
 
-export default router;
+export default router; 
