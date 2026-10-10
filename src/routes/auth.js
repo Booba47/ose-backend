@@ -1,3 +1,4 @@
+
 import { Router } from 'express';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import {
@@ -20,11 +21,13 @@ router.post('/register', async (req, res) => {
     const city = cleanString(req.body?.city);
     const bio = cleanString(req.body?.bio);
     const lookingFor = cleanString(req.body?.lookingFor);
+
     const interests = Array.isArray(req.body?.interests)
       ? req.body.interests
           .filter((item) => typeof item === 'string')
           .map((item) => item.trim())
           .filter(Boolean)
+          .slice(0, 30)
       : [];
 
     if (!isValidEmail(email)) {
@@ -41,10 +44,10 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    if (!isNonEmptyString(name)) {
+    if (!isNonEmptyString(name) || name.length > 80) {
       return res.status(400).json({
         success: false,
-        message: 'Le prénom est obligatoire.',
+        message: 'Le prénom est obligatoire et limité à 80 caractères.',
       });
     }
 
@@ -52,6 +55,13 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'Ose est réservée aux personnes âgées de 18 ans et plus.',
+      });
+    }
+
+    if (city.length > 120 || bio.length > 1000 || lookingFor.length > 120) {
+      return res.status(400).json({
+        success: false,
+        message: 'Un des champs du profil est trop long.',
       });
     }
 
@@ -66,47 +76,65 @@ router.post('/register', async (req, res) => {
     if (error) {
       return res.status(400).json({
         success: false,
-        message: error.message,
+        message: 'Impossible de créer le compte. Vérifie les informations saisies.',
       });
     }
 
-    if (data.user) {
-      const { error: profileError } = await supabaseAdmin
-        .from('profiles')
-        .upsert({
-          id: data.user.id,
-          name,
-          birth_date: birthDate,
-          city,
-          bio,
-          looking_for: lookingFor,
-          interests,
-        });
+    if (!data.user) {
+      return res.status(500).json({
+        success: false,
+        message: 'La création du compte n’a pas abouti.',
+      });
+    }
 
-      if (profileError) {
-        console.error('Erreur création profil :', profileError);
-      }
+    // Créer le profil et les préférences côté serveur.
+    const { error: profileError } = await supabaseAdmin
+      .from('profiles')
+      .upsert({
+        id: data.user.id,
+        name,
+        birth_date: birthDate,
+        city,
+        bio,
+        looking_for: lookingFor,
+        interests,
+      });
 
-      const { error: preferencesError } = await supabaseAdmin
-        .from('preferences')
-        .upsert({ user_id: data.user.id });
+    if (profileError) {
+      console.error('Erreur création profil :', profileError);
 
-      if (preferencesError) {
-        console.error('Erreur création préférences :', preferencesError);
-      }
+      // Ne pas supprimer le compte Auth : il pourra être réparé
+      // côté serveur sans perdre l'inscription.
+      return res.status(500).json({
+        success: false,
+        accountCreated: true,
+        message: 'Compte créé, mais le profil n’a pas pu être enregistré. Contacte le support.',
+      });
+    }
+
+    const { error: preferencesError } = await supabaseAdmin
+      .from('preferences')
+      .upsert({ user_id: data.user.id });
+
+    if (preferencesError) {
+      console.error('Erreur création préférences :', preferencesError);
+
+      return res.status(500).json({
+        success: false,
+        accountCreated: true,
+        message: 'Compte créé, mais les préférences n’ont pas pu être initialisées.',
+      });
     }
 
     return res.status(201).json({
       success: true,
       message: data.session
-        ? 'Compte créé avec succès.'
-        : 'Compte créé. Vérifie ton e-mail pour confirmer ton inscription.',
-      user: data.user
-        ? {
-            id: data.user.id,
-            email: data.user.email,
-          }
-        : null,
+        ? 'Compte créé. Tu peux te connecter.'
+        : 'Compte créé. Vérifie ton e-mail pour confirmer ton inscription avant de te connecter.',
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+      },
       session: data.session
         ? {
             accessToken: data.session.access_token,
@@ -186,6 +214,13 @@ router.get('/me', async (req, res) => {
 
     const token = authorization.substring(7).trim();
 
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Token manquant.',
+      });
+    }
+
     const { data, error } = await supabase.auth.getUser(token);
 
     if (error || !data.user) {
@@ -226,6 +261,13 @@ router.post('/logout', async (req, res) => {
 
     const token = authorization.substring(7).trim();
 
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'Token manquant.',
+      });
+    }
+
     const { data, error } = await supabase.auth.getUser(token);
 
     if (error || !data.user) {
@@ -235,10 +277,17 @@ router.post('/logout', async (req, res) => {
       });
     }
 
-    const { error: logoutError } = await supabase.auth.admin.signOut(token);
+    // Révoquer les sessions de cet utilisateur côté serveur.
+    const { error: logoutError } =
+      await supabaseAdmin.auth.admin.signOut(token, 'global');
 
     if (logoutError) {
       console.error('Erreur déconnexion Supabase :', logoutError);
+
+      return res.status(500).json({
+        success: false,
+        message: 'La déconnexion côté serveur a échoué.',
+      });
     }
 
     return res.json({
@@ -267,10 +316,20 @@ router.post('/forgot-password', async (req, res) => {
       });
     }
 
-    const { error } = await supabase.auth.resetPasswordForEmail(email);
+    const redirectTo = process.env.PASSWORD_RESET_REDIRECT_URL;
+
+    const { error } = await supabase.auth.resetPasswordForEmail(
+      email,
+      redirectTo ? { redirectTo } : undefined,
+    );
 
     if (error) {
       console.error('Erreur réinitialisation :', error);
+
+      return res.status(500).json({
+        success: false,
+        message: 'Impossible d’envoyer la demande pour le moment.',
+      });
     }
 
     return res.json({
@@ -288,3 +347,4 @@ router.post('/forgot-password', async (req, res) => {
 });
 
 export default router;
+ 
