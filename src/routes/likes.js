@@ -1,16 +1,61 @@
+
 import { Router } from 'express';
 import { supabaseAdmin } from '../config/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
-import { isNonEmptyString, isValidUuid } from '../utils/validation.js';
+import { isValidUUID } from '../utils/validation.js';
 
 const router = Router();
+
+async function isBlocked(userId, profileId) {
+  const { data, error } = await supabaseAdmin
+    .from('blocks')
+    .select('id')
+    .or(
+      `and(user_id.eq.${userId},blocked_user_id.eq.${profileId}),and(user_id.eq.${profileId},blocked_user_id.eq.${userId})`,
+    )
+    .limit(1);
+
+  if (error) {
+    console.error('Erreur vérification blocage :', error);
+    throw new Error('BLOCK_CHECK_FAILED');
+  }
+
+  return (data ?? []).length > 0;
+}
+
+async function getTargetProfile(profileId, res) {
+  const { data, error } = await supabaseAdmin
+    .from('profiles')
+    .select('id')
+    .eq('id', profileId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Erreur vérification profil :', error);
+    res.status(500).json({
+      success: false,
+      message: 'Impossible de vérifier ce profil.',
+    });
+    return null;
+  }
+
+  if (!data) {
+    res.status(404).json({
+      success: false,
+      message: 'Profil introuvable.',
+    });
+    return null;
+  }
+
+  return data;
+}
 
 // ENREGISTRER UN LIKE
 router.post('/:profileId', requireAuth, async (req, res) => {
   try {
     const profileId = req.params.profileId;
 
-    if (!isValidUuid(profileId)) {
+    if (!isValidUUID(profileId)) {
       return res.status(400).json({
         success: false,
         message: 'Identifiant de profil invalide.',
@@ -24,43 +69,17 @@ router.post('/:profileId', requireAuth, async (req, res) => {
       });
     }
 
-    const { data: target, error: targetError } = await supabaseAdmin
-      .from('profiles')
-      .select('id')
-      .eq('id', profileId)
-      .maybeSingle();
+    const target = await getTargetProfile(profileId, res);
+    if (!target) return;
 
-    if (targetError || !target) {
-      return res.status(404).json({
-        success: false,
-        message: 'Profil introuvable.',
-      });
-    }
-
-    // Un profil bloqué dans un sens ou dans l'autre ne peut pas être aimé.
-    const { data: blocks, error: blockError } = await supabaseAdmin
-      .from('blocks')
-      .select('id')
-      .or(
-        `and(user_id.eq.${req.user.id},blocked_user_id.eq.${profileId}),and(user_id.eq.${profileId},blocked_user_id.eq.${req.user.id})`,
-      )
-      .limit(1);
-
-    if (blockError) {
-      console.error('Erreur vérification blocage :', blockError);
-      return res.status(500).json({
-        success: false,
-        message: 'Impossible de traiter ce like.',
-      });
-    }
-
-    if (blocks?.length) {
+    if (await isBlocked(req.user.id, profileId)) {
       return res.status(403).json({
         success: false,
         message: 'Cette interaction n’est pas autorisée.',
       });
     }
 
+    // Retirer un éventuel pass précédent.
     const { error: passError } = await supabaseAdmin
       .from('passes')
       .delete()
@@ -75,6 +94,7 @@ router.post('/:profileId', requireAuth, async (req, res) => {
       });
     }
 
+    // Enregistrer le like sans créer de doublon.
     const { error: likeError } = await supabaseAdmin
       .from('likes')
       .upsert(
@@ -86,14 +106,14 @@ router.post('/:profileId', requireAuth, async (req, res) => {
       );
 
     if (likeError) {
-      console.error('Erreur like :', likeError);
+      console.error('Erreur enregistrement like :', likeError);
       return res.status(500).json({
         success: false,
         message: 'Impossible d’enregistrer ce like.',
       });
     }
 
-    // Vérifier si l'autre personne nous a déjà aimés.
+    // Vérifier le like réciproque.
     const { data: reciprocalLike, error: reciprocalError } =
       await supabaseAdmin
         .from('likes')
@@ -113,19 +133,23 @@ router.post('/:profileId', requireAuth, async (req, res) => {
     let match = null;
 
     if (reciprocalLike) {
-      const [firstUser, secondUser] = [req.user.id, profileId].sort();
+      const [firstUser, secondUser] = [
+        req.user.id,
+        profileId,
+      ].sort();
 
-      const { data: createdMatch, error: matchError } = await supabaseAdmin
-        .from('matches')
-        .upsert(
-          {
-            user_one_id: firstUser,
-            user_two_id: secondUser,
-          },
-          { onConflict: 'user_one_id,user_two_id' },
-        )
-        .select('id, user_one_id, user_two_id, created_at')
-        .single();
+      const { data: createdMatch, error: matchError } =
+        await supabaseAdmin
+          .from('matches')
+          .upsert(
+            {
+              user_one_id: firstUser,
+              user_two_id: secondUser,
+            },
+            { onConflict: 'user_one_id,user_two_id' },
+          )
+          .select('id, user_one_id, user_two_id, created_at')
+          .single();
 
       if (matchError) {
         console.error('Erreur création match :', matchError);
@@ -137,15 +161,26 @@ router.post('/:profileId', requireAuth, async (req, res) => {
 
       match = createdMatch;
 
+      // Une seule conversation par match.
       const { error: conversationError } = await supabaseAdmin
         .from('conversations')
         .upsert(
           { match_id: match.id },
-          { onConflict: 'match_id' },
+          { onConflict: 'match_id', ignoreDuplicates: true },
         );
 
       if (conversationError) {
-        console.error('Erreur création conversation :', conversationError);
+        console.error(
+          'Erreur création conversation :',
+          conversationError,
+        );
+
+        return res.status(500).json({
+          success: false,
+          message: 'Match créé, mais création de la conversation impossible.',
+          isMatch: true,
+          match,
+        });
       }
     }
 
@@ -157,7 +192,15 @@ router.post('/:profileId', requireAuth, async (req, res) => {
       match,
     });
   } catch (error) {
+    if (error.message === 'BLOCK_CHECK_FAILED') {
+      return res.status(500).json({
+        success: false,
+        message: 'Impossible de vérifier les blocages.',
+      });
+    }
+
     console.error('Erreur route like :', error);
+
     return res.status(500).json({
       success: false,
       message: 'Erreur interne.',
@@ -170,7 +213,7 @@ router.post('/:profileId/pass', requireAuth, async (req, res) => {
   try {
     const profileId = req.params.profileId;
 
-    if (!isValidUuid(profileId)) {
+    if (!isValidUUID(profileId)) {
       return res.status(400).json({
         success: false,
         message: 'Identifiant de profil invalide.',
@@ -184,16 +227,13 @@ router.post('/:profileId/pass', requireAuth, async (req, res) => {
       });
     }
 
-    const { data: target, error: targetError } = await supabaseAdmin
-      .from('profiles')
-      .select('id')
-      .eq('id', profileId)
-      .maybeSingle();
+    const target = await getTargetProfile(profileId, res);
+    if (!target) return;
 
-    if (targetError || !target) {
-      return res.status(404).json({
+    if (await isBlocked(req.user.id, profileId)) {
+      return res.status(403).json({
         success: false,
-        message: 'Profil introuvable.',
+        message: 'Cette interaction n’est pas autorisée.',
       });
     }
 
@@ -204,14 +244,14 @@ router.post('/:profileId/pass', requireAuth, async (req, res) => {
       .eq('liked_user_id', profileId);
 
     if (likeError) {
-      console.error('Erreur retrait like :', likeError);
+      console.error('Erreur retrait like avant pass :', likeError);
       return res.status(500).json({
         success: false,
         message: 'Impossible d’enregistrer ce choix.',
       });
     }
 
-    const { error } = await supabaseAdmin
+    const { error: passError } = await supabaseAdmin
       .from('passes')
       .upsert(
         {
@@ -221,8 +261,8 @@ router.post('/:profileId/pass', requireAuth, async (req, res) => {
         { onConflict: 'user_id,passed_user_id' },
       );
 
-    if (error) {
-      console.error('Erreur pass :', error);
+    if (passError) {
+      console.error('Erreur enregistrement pass :', passError);
       return res.status(500).json({
         success: false,
         message: 'Impossible d’enregistrer ce choix.',
@@ -235,7 +275,15 @@ router.post('/:profileId/pass', requireAuth, async (req, res) => {
       passed: true,
     });
   } catch (error) {
+    if (error.message === 'BLOCK_CHECK_FAILED') {
+      return res.status(500).json({
+        success: false,
+        message: 'Impossible de vérifier les blocages.',
+      });
+    }
+
     console.error('Erreur route pass :', error);
+
     return res.status(500).json({
       success: false,
       message: 'Erreur interne.',
@@ -266,6 +314,7 @@ router.get('/mine/list', requireAuth, async (req, res) => {
     });
   } catch (error) {
     console.error('Erreur lecture likes :', error);
+
     return res.status(500).json({
       success: false,
       message: 'Erreur interne.',
@@ -278,7 +327,7 @@ router.delete('/:profileId', requireAuth, async (req, res) => {
   try {
     const profileId = req.params.profileId;
 
-    if (!isValidUuid(profileId) || profileId === req.user.id) {
+    if (!isValidUUID(profileId) || profileId === req.user.id) {
       return res.status(400).json({
         success: false,
         message: 'Identifiant de profil invalide.',
@@ -305,6 +354,7 @@ router.delete('/:profileId', requireAuth, async (req, res) => {
     });
   } catch (error) {
     console.error('Erreur retrait like :', error);
+
     return res.status(500).json({
       success: false,
       message: 'Erreur interne.',
@@ -313,3 +363,4 @@ router.delete('/:profileId', requireAuth, async (req, res) => {
 });
 
 export default router;
+ 
