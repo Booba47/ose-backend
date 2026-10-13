@@ -1,3 +1,4 @@
+
 import { supabase } from '../config/supabase.js';
 
 export async function requireAuth(req, res, next) {
@@ -42,7 +43,7 @@ export async function requireAuth(req, res, next) {
     req.user = user;
     req.accessToken = token;
 
-    next();
+    return next();
   } catch (error) {
     console.error('Erreur middleware auth:', error);
 
@@ -51,4 +52,5 @@ export async function requireAuth(req, res, next) {
       message: 'Erreur lors de la vérification de l’authentification.',
     });
   }
-          }
+}
+ 
