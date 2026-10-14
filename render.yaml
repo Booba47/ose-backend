@@ -27,3 +27,6 @@ services:
 
       - key: JWT_SECRET
         generateValue: true
+
+      - key: PASSWORD_RESET_REDIRECT_URL
+        sync: false 
